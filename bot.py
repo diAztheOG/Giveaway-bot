@@ -202,7 +202,6 @@ class PredictionDropdownView(discord.ui.View):
         self.add_item(ChampionSelect(players))
 
     async def check_and_save(self, interaction: discord.Interaction):
-        # Wait until both dropdowns have been selected
         if not self.first_out or not self.champion:
             status_lines = [
                 f"**CoinPoker Username:** `{self.cp_username}`",
@@ -622,7 +621,6 @@ async def start_prediction(
     image_url: Optional[str] = None,
 ):
     player_list = [p.strip() for p in players.split(",") if p.strip()]
-    # Deduplicate while preserving order
     seen = set()
     unique_players = []
     for p in player_list:
@@ -648,7 +646,7 @@ async def start_prediction(
             f"**Final Table Lineup:**\n{formatted_roster}\n\n"
             "**Rules:**\n"
             "• One submission per user\n"
-            "• Two separate prizes — one winner drawn from correct **1st Out** picks, one from correct **Champion** picks!"
+            "• **2 winners** drawn from correct **1st Out** picks & **2 winners** drawn from correct **Champion** picks!"
         ),
         color=discord.Color.blurple(),
     )
@@ -722,12 +720,13 @@ async def stop_prediction(interaction: discord.Interaction, message_id: str):
 
 @bot.tree.command(
     name="draw_prediction",
-    description="Draw 2 distinct winners from correct Watch Party picks",
+    description="Draw winners from correct Watch Party picks (default: 2 per category)",
 )
 @app_commands.describe(
     message_id="The ID of the prediction message",
     first_out="Exact name of the player eliminated FIRST",
     champion="Exact name of the tournament WINNER",
+    winners_per_pick="Number of winners to pick per category (default: 2)",
 )
 @app_commands.checks.has_permissions(manage_messages=True)
 async def draw_prediction(
@@ -735,6 +734,7 @@ async def draw_prediction(
     message_id: str,
     first_out: str,
     champion: str,
+    winners_per_pick: int = 2,
 ):
     msg_id = message_id.strip()
     current_preds = load_json(PREDICTIONS_FILE)
@@ -748,7 +748,6 @@ async def draw_prediction(
         return
 
     players = event_data.get("players", [])
-    # Match admin input case-insensitively against stored player list
     matched_first = next(
         (p for p in players if p.lower() == first_out.strip().lower()), None
     )
@@ -765,6 +764,7 @@ async def draw_prediction(
         return
 
     entries = event_data["entries"]
+    count = max(1, winners_per_pick)
 
     # Pool 1: Correct 1st Elimination
     first_out_pool = [
@@ -780,18 +780,28 @@ async def draw_prediction(
         if data["champion"] == matched_champ
     ]
 
-    first_winner_id = random.choice(first_out_pool) if first_out_pool else None
+    first_winner_ids = (
+        random.sample(first_out_pool, min(count, len(first_out_pool)))
+        if first_out_pool
+        else []
+    )
 
-    # Exclude first_winner_id from champion_pool if other valid guessers exist
-    filtered_champ_pool = [
-        uid for uid in champion_pool if uid != first_winner_id
+    # Prioritize distinct winners by excluding first_winner_ids when possible
+    unique_champ_pool = [
+        uid for uid in champion_pool if uid not in first_winner_ids
     ]
-    if filtered_champ_pool:
-        champ_winner_id = random.choice(filtered_champ_pool)
-    elif champion_pool:
-        champ_winner_id = random.choice(champion_pool)
-    else:
-        champ_winner_id = None
+    champ_winner_ids = random.sample(
+        unique_champ_pool, min(count, len(unique_champ_pool))
+    )
+
+    # If fewer than `count` unique winners were available, top up from overlapping pool
+    if len(champ_winner_ids) < count:
+        overlap_pool = [
+            uid for uid in champion_pool if uid not in champ_winner_ids
+        ]
+        needed = min(count - len(champ_winner_ids), len(overlap_pool))
+        if needed > 0:
+            champ_winner_ids.extend(random.sample(overlap_pool, needed))
 
     title = event_data.get("title", "Watch Party Prediction")
 
@@ -799,18 +809,18 @@ async def draw_prediction(
     csv_buffer = io.StringIO()
     writer = csv.writer(csv_buffer)
     writer.writerow(["Category", "Discord_ID", "CoinPoker_Username", "Pick"])
-    if first_winner_id:
+    for uid in first_winner_ids:
         writer.writerow([
             "1st Elimination",
-            first_winner_id,
-            entries[first_winner_id]["username"],
+            uid,
+            entries[uid]["username"],
             matched_first,
         ])
-    if champ_winner_id:
+    for uid in champ_winner_ids:
         writer.writerow([
             "Tournament Winner",
-            champ_winner_id,
-            entries[champ_winner_id]["username"],
+            uid,
+            entries[uid]["username"],
             matched_champ,
         ])
 
@@ -820,17 +830,29 @@ async def draw_prediction(
         filename=f"watchparty_winners_{msg_id}.csv",
     )
 
-    first_winner_text = (
-        f"<@{first_winner_id}> (`{entries[first_winner_id]['username']}`) — picked **{matched_first}** ({len(first_out_pool)} guessed right)"
-        if first_winner_id
-        else f"No one guessed **{matched_first}**!"
-    )
+    if first_winner_ids:
+        first_mentions = "\n".join(
+            f"• <@{uid}> (`{entries[uid]['username']}`)"
+            for uid in first_winner_ids
+        )
+        first_winner_text = (
+            f"{first_mentions}\n"
+            f"*(Picked **{matched_first}** — {len(first_out_pool)} total guessed right)*"
+        )
+    else:
+        first_winner_text = f"No one guessed **{matched_first}**!"
 
-    champ_winner_text = (
-        f"<@{champ_winner_id}> (`{entries[champ_winner_id]['username']}`) — picked **{matched_champ}** ({len(champion_pool)} guessed right)"
-        if champ_winner_id
-        else f"No one guessed **{matched_champ}**!"
-    )
+    if champ_winner_ids:
+        champ_mentions = "\n".join(
+            f"• <@{uid}> (`{entries[uid]['username']}`)"
+            for uid in champ_winner_ids
+        )
+        champ_winner_text = (
+            f"{champ_mentions}\n"
+            f"*(Picked **{matched_champ}** — {len(champion_pool)} total guessed right)*"
+        )
+    else:
+        champ_winner_text = f"No one guessed **{matched_champ}**!"
 
     result_msg = (
         f"🏆 **Watch Party Results — `{title}`!**\n"
