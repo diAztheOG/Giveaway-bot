@@ -6,7 +6,7 @@ import os
 import random
 import time
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import discord
 from discord import app_commands
@@ -21,6 +21,7 @@ BASE_DIR = os.getenv("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
 os.makedirs(BASE_DIR, exist_ok=True)
 DATA_FILE = os.path.join(BASE_DIR, "giveaways.json")
 WINNERS_FILE = os.path.join(BASE_DIR, "winners_history.json")
+PREDICTIONS_FILE = os.path.join(BASE_DIR, "predictions.json")
 
 
 # --- PERSISTENT STORAGE HELPERS ---
@@ -47,8 +48,9 @@ def save_json(file_path: str, data: dict):
             return
 
 
-# Load existing giveaways on startup
+# Load existing data on startup
 giveaways: Dict[str, Dict[str, str]] = load_json(DATA_FILE)
+predictions: Dict[str, dict] = load_json(PREDICTIONS_FILE)
 
 
 def load_winners_history() -> dict:
@@ -59,7 +61,9 @@ def save_winners_history(history: dict):
     save_json(WINNERS_FILE, history)
 
 
-async def auto_close_giveaway(msg: discord.Message, duration_minutes: int):
+async def auto_close_message(
+    msg: discord.Message, duration_minutes: int, closed_label: str = "Closed 🔒"
+):
     await asyncio.sleep(duration_minutes * 60)
 
     try:
@@ -68,13 +72,14 @@ async def auto_close_giveaway(msg: discord.Message, duration_minutes: int):
 
         if (
             target_message.embeds
-            and target_message.embeds[0].footer.text == "🔒 Giveaway Closed"
+            and target_message.embeds[0].footer.text
+            and "Closed" in target_message.embeds[0].footer.text
         ):
             return
 
         disabled_view = discord.ui.View()
         disabled_btn = discord.ui.Button(
-            label="Giveaway Closed 🔒",
+            label=closed_label,
             style=discord.ButtonStyle.secondary,
             disabled=True,
         )
@@ -83,15 +88,18 @@ async def auto_close_giveaway(msg: discord.Message, duration_minutes: int):
         embed = (
             target_message.embeds[0]
             if target_message.embeds
-            else discord.Embed(title="Giveaway Ended")
+            else discord.Embed(title="Event Ended")
         )
-        embed.set_footer(text="🔒 Giveaway Closed")
+        embed.set_footer(text=f"🔒 {closed_label}")
 
         await target_message.edit(embed=embed, view=disabled_view)
     except Exception as e:
-        print(f"Failed to auto-close giveaway {msg.id}: {e}")
+        print(f"Failed to auto-close message {msg.id}: {e}")
 
 
+# ==========================================
+# 1. STANDARD GIVEAWAY VIEWS & MODALS
+# ==========================================
 class UsernameModal(discord.ui.Modal, title="Giveaway Entry"):
     cp_username = discord.ui.TextInput(
         label="CoinPoker Username",
@@ -136,7 +144,6 @@ class GiveawayView(discord.ui.View):
         msg_id = str(interaction.message.id)
         user_id = str(interaction.user.id)
 
-        # Check if already registered in this specific giveaway
         current_data = load_json(DATA_FILE)
         if msg_id in current_data and user_id in current_data[msg_id]:
             await interaction.response.send_message(
@@ -148,6 +155,179 @@ class GiveawayView(discord.ui.View):
         await interaction.response.send_modal(UsernameModal(message_id=msg_id))
 
 
+# ==========================================
+# 2. WATCH PARTY PREDICTION VIEWS & MODALS
+# ==========================================
+class FirstOutSelect(discord.ui.Select):
+    def __init__(self, players: List[str]):
+        options = [discord.SelectOption(label=p, value=p) for p in players[:25]]
+        super().__init__(
+            placeholder="1️⃣ Select who drops out FIRST...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.first_out = self.values[0]
+        await self.view.check_and_save(interaction)
+
+
+class ChampionSelect(discord.ui.Select):
+    def __init__(self, players: List[str]):
+        options = [discord.SelectOption(label=p, value=p) for p in players[:25]]
+        super().__init__(
+            placeholder="2️⃣ Select who WINS the tournament...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.champion = self.values[0]
+        await self.view.check_and_save(interaction)
+
+
+class PredictionDropdownView(discord.ui.View):
+    def __init__(self, message_id: str, cp_username: str, players: List[str]):
+        super().__init__(timeout=300)
+        self.message_id = str(message_id)
+        self.cp_username = cp_username
+        self.first_out: Optional[str] = None
+        self.champion: Optional[str] = None
+
+        self.add_item(FirstOutSelect(players))
+        self.add_item(ChampionSelect(players))
+
+    async def check_and_save(self, interaction: discord.Interaction):
+        # Wait until both dropdowns have been selected
+        if not self.first_out or not self.champion:
+            status_lines = [
+                f"**CoinPoker Username:** `{self.cp_username}`",
+                f"• **1st Out:** {f'**{self.first_out}** ✅' if self.first_out else '*Waiting for selection...*'}",
+                f"• **Winner:** {f'**{self.champion}** ✅' if self.champion else '*Waiting for selection...*'}",
+            ]
+            await interaction.response.edit_message(
+                content="🎯 **Almost done! Make your second pick below:**\n\n"
+                + "\n".join(status_lines),
+                view=self,
+            )
+            return
+
+        if self.first_out == self.champion:
+            await interaction.response.edit_message(
+                content="⚠️ **Invalid combo:** The same player can't be eliminated first AND win! Pick two different players below:",
+                view=self,
+            )
+            return
+
+        user_id = str(interaction.user.id)
+        current_preds = load_json(PREDICTIONS_FILE)
+
+        if self.message_id not in current_preds:
+            current_preds[self.message_id] = {"players": [], "entries": {}}
+
+        if user_id in current_preds[self.message_id]["entries"]:
+            await interaction.response.edit_message(
+                content="⚠️ **You already locked in your picks for this watch party!**",
+                view=None,
+            )
+            return
+
+        current_preds[self.message_id]["entries"][user_id] = {
+            "username": self.cp_username,
+            "first_out": self.first_out,
+            "champion": self.champion,
+        }
+        save_json(PREDICTIONS_FILE, current_preds)
+        predictions.update(current_preds)
+
+        await interaction.response.edit_message(
+            content=(
+                f"✅ **Picks Locked In!**\n"
+                f"• **CoinPoker Username:** `{self.cp_username}`\n"
+                f"• **1st Final Table Out:** `{self.first_out}`\n"
+                f"• **Tournament Winner:** `{self.champion}`\n\n"
+                f"*Good luck watching the final table!*"
+            ),
+            view=None,
+        )
+
+
+class PredictionUsernameModal(discord.ui.Modal, title="Watch Party Picks — Step 1"):
+    cp_username = discord.ui.TextInput(
+        label="CoinPoker Username",
+        placeholder="e.g. coinbluffer69",
+        required=True,
+        max_length=50,
+    )
+
+    def __init__(self, message_id: str, players: List[str]):
+        super().__init__()
+        self.message_id = str(message_id)
+        self.players = players
+
+    async def on_submit(self, interaction: discord.Interaction):
+        entry_name = self.cp_username.value.strip()
+        view = PredictionDropdownView(
+            message_id=self.message_id,
+            cp_username=entry_name,
+            players=self.players,
+        )
+        await interaction.response.send_message(
+            f"🎯 **Step 2 — Select your two picks from the dropdowns below** (Username: `{entry_name}`):",
+            view=view,
+            ephemeral=True,
+        )
+
+
+class PredictionLaunchView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Submit Picks 🎯",
+        style=discord.ButtonStyle.primary,
+        custom_id="submit_prediction_btn",
+    )
+    async def predict_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        msg_id = str(interaction.message.id)
+        user_id = str(interaction.user.id)
+
+        current_preds = load_json(PREDICTIONS_FILE)
+        event_data = current_preds.get(msg_id)
+
+        if not event_data or not event_data.get("players"):
+            await interaction.response.send_message(
+                "❌ This prediction event could not be found or has no players configured.",
+                ephemeral=True,
+            )
+            return
+
+        if user_id in event_data.get("entries", {}):
+            existing = event_data["entries"][user_id]
+            await interaction.response.send_message(
+                f"⚠️ **You already submitted your picks!**\n"
+                f"• **1st Out:** `{existing['first_out']}`\n"
+                f"• **Winner:** `{existing['champion']}`",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_modal(
+            PredictionUsernameModal(
+                message_id=msg_id, players=event_data["players"]
+            )
+        )
+
+
+# ==========================================
+# 3. BOT SETUP & SLASH COMMANDS
+# ==========================================
 class GiveawayBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -155,6 +335,7 @@ class GiveawayBot(commands.Bot):
 
     async def setup_hook(self):
         self.add_view(GiveawayView())
+        self.add_view(PredictionLaunchView())
         await self.tree.sync()
 
 
@@ -166,6 +347,7 @@ async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
 
+# --- STANDARD GIVEAWAY COMMANDS ---
 @bot.tree.command(
     name="start_giveaway", description="Start a new custom giveaway"
 )
@@ -205,7 +387,9 @@ async def start_giveaway(
     save_json(DATA_FILE, giveaways)
 
     if duration_minutes and duration_minutes > 0:
-        bot.loop.create_task(auto_close_giveaway(msg, duration_minutes))
+        bot.loop.create_task(
+            auto_close_message(msg, duration_minutes, "Giveaway Closed 🔒")
+        )
 
 
 @bot.tree.command(
@@ -281,7 +465,6 @@ async def draw_giveaway(
 
     entries = current_data[msg_id]
 
-    # --- FILTER OUT PREVIOUS WINNERS ---
     history = load_winners_history()
     locked_discord = history.get("discord_ids", {})
     locked_usernames = history.get("usernames", {})
@@ -289,7 +472,8 @@ async def draw_giveaway(
     eligible_user_ids = [
         uid
         for uid, cp_name in entries.items()
-        if str(uid) not in locked_discord and cp_name.strip().lower() not in locked_usernames
+        if str(uid) not in locked_discord
+        and cp_name.strip().lower() not in locked_usernames
     ]
 
     if not eligible_user_ids:
@@ -301,11 +485,8 @@ async def draw_giveaway(
 
     actual_winners_count = min(winners_count, len(eligible_user_ids))
     winner_ids = random.sample(eligible_user_ids, actual_winners_count)
-
-    # SORT WINNERS ALPHABETICALLY BY COINPOKER USERNAME (case-insensitive)
     winner_ids.sort(key=lambda uid: entries[uid].lower())
 
-    # --- RECORD NEW WINNERS TO HISTORY ---
     if "discord_ids" not in history:
         history["discord_ids"] = {}
     if "usernames" not in history:
@@ -322,7 +503,6 @@ async def draw_giveaway(
         history["usernames"][cp_user.lower()] = str(uid)
 
     save_winners_history(history)
-    # --------------------------------------
 
     csv_buffer = io.StringIO()
     writer = csv.writer(csv_buffer)
@@ -420,6 +600,246 @@ async def reset_history(interaction: discord.Interaction):
         "🗑️ **Winner history has been completely wiped!** All users are now eligible again.",
         ephemeral=True,
     )
+
+
+# --- WATCH PARTY PREDICTION COMMANDS ---
+@bot.tree.command(
+    name="start_prediction",
+    description="Start a Final Table Watch Party prediction game with dropdowns",
+)
+@app_commands.describe(
+    title="Watch party title (e.g. Sunday Special Final Table Watch Party)",
+    players="Comma-separated list of finalists (e.g. Player1, Player2, Player3, Player4, Player5, Player6, Player7)",
+    duration_minutes="Optional: Auto-lock picks after X minutes",
+    image_url="Optional: Banner image URL",
+)
+@app_commands.checks.has_permissions(manage_messages=True)
+async def start_prediction(
+    interaction: discord.Interaction,
+    title: str,
+    players: str,
+    duration_minutes: Optional[int] = None,
+    image_url: Optional[str] = None,
+):
+    player_list = [p.strip() for p in players.split(",") if p.strip()]
+    # Deduplicate while preserving order
+    seen = set()
+    unique_players = []
+    for p in player_list:
+        if p.lower() not in seen:
+            seen.add(p.lower())
+            unique_players.append(p)
+
+    if len(unique_players) < 2 or len(unique_players) > 25:
+        await interaction.response.send_message(
+            "❌ Please provide between **2 and 25** unique player names separated by commas.",
+            ephemeral=True,
+        )
+        return
+
+    formatted_roster = "\n".join(f"• **{p}**" for p in unique_players)
+
+    embed = discord.Embed(
+        title=f"🎯 {title}",
+        description=(
+            "Click **Submit Picks 🎯** below to enter your CoinPoker username and select:\n"
+            "1️⃣ **First player eliminated** from the final table\n"
+            "2️⃣ **Tournament champion**\n\n"
+            f"**Final Table Lineup:**\n{formatted_roster}\n\n"
+            "**Rules:**\n"
+            "• One submission per user\n"
+            "• Two separate prizes — one winner drawn from correct **1st Out** picks, one from correct **Champion** picks!"
+        ),
+        color=discord.Color.blurple(),
+    )
+
+    if image_url:
+        embed.set_image(url=image_url.strip())
+
+    if duration_minutes:
+        embed.set_footer(text=f"⏱️ Picks lock in {duration_minutes} minute(s)")
+
+    await interaction.response.send_message(
+        "Starting watch party prediction...", ephemeral=True
+    )
+
+    view = PredictionLaunchView()
+    msg = await interaction.channel.send(embed=embed, view=view)
+
+    current_preds = load_json(PREDICTIONS_FILE)
+    current_preds[str(msg.id)] = {
+        "title": title,
+        "players": unique_players,
+        "entries": {},
+    }
+    save_json(PREDICTIONS_FILE, current_preds)
+    predictions.update(current_preds)
+
+    if duration_minutes and duration_minutes > 0:
+        bot.loop.create_task(
+            auto_close_message(msg, duration_minutes, "Picks Locked 🔒")
+        )
+
+
+@bot.tree.command(
+    name="stop_prediction",
+    description="Lock Watch Party picks so no new submissions can be made",
+)
+@app_commands.describe(message_id="The ID of the prediction message to lock")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def stop_prediction(interaction: discord.Interaction, message_id: str):
+    try:
+        msg_id = message_id.strip()
+        target_message = await interaction.channel.fetch_message(int(msg_id))
+
+        disabled_view = discord.ui.View()
+        disabled_btn = discord.ui.Button(
+            label="Picks Locked 🔒",
+            style=discord.ButtonStyle.secondary,
+            disabled=True,
+        )
+        disabled_view.add_item(disabled_btn)
+
+        embed = (
+            target_message.embeds[0]
+            if target_message.embeds
+            else discord.Embed(title="Picks Locked")
+        )
+        embed.set_footer(text="🔒 Picks Locked")
+
+        await target_message.edit(embed=embed, view=disabled_view)
+
+        await interaction.response.send_message(
+            f"🔒 **Watch party `{msg_id}` is now locked!**",
+            ephemeral=True,
+        )
+    except Exception:
+        await interaction.response.send_message(
+            f"❌ Could not find message with ID `{message_id}` in this channel.",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(
+    name="draw_prediction",
+    description="Draw 2 distinct winners from correct Watch Party picks",
+)
+@app_commands.describe(
+    message_id="The ID of the prediction message",
+    first_out="Exact name of the player eliminated FIRST",
+    champion="Exact name of the tournament WINNER",
+)
+@app_commands.checks.has_permissions(manage_messages=True)
+async def draw_prediction(
+    interaction: discord.Interaction,
+    message_id: str,
+    first_out: str,
+    champion: str,
+):
+    msg_id = message_id.strip()
+    current_preds = load_json(PREDICTIONS_FILE)
+    event_data = current_preds.get(msg_id)
+
+    if not event_data or not event_data.get("entries"):
+        await interaction.response.send_message(
+            "❌ No entries found for that prediction message ID.",
+            ephemeral=True,
+        )
+        return
+
+    players = event_data.get("players", [])
+    # Match admin input case-insensitively against stored player list
+    matched_first = next(
+        (p for p in players if p.lower() == first_out.strip().lower()), None
+    )
+    matched_champ = next(
+        (p for p in players if p.lower() == champion.strip().lower()), None
+    )
+
+    if not matched_first or not matched_champ:
+        await interaction.response.send_message(
+            f"❌ Player name didn't match the event roster.\n"
+            f"**Valid players:** `{', '.join(players)}`",
+            ephemeral=True,
+        )
+        return
+
+    entries = event_data["entries"]
+
+    # Pool 1: Correct 1st Elimination
+    first_out_pool = [
+        uid
+        for uid, data in entries.items()
+        if data["first_out"] == matched_first
+    ]
+
+    # Pool 2: Correct Tournament Champion
+    champion_pool = [
+        uid
+        for uid, data in entries.items()
+        if data["champion"] == matched_champ
+    ]
+
+    first_winner_id = random.choice(first_out_pool) if first_out_pool else None
+
+    # Exclude first_winner_id from champion_pool if other valid guessers exist
+    filtered_champ_pool = [
+        uid for uid in champion_pool if uid != first_winner_id
+    ]
+    if filtered_champ_pool:
+        champ_winner_id = random.choice(filtered_champ_pool)
+    elif champion_pool:
+        champ_winner_id = random.choice(champion_pool)
+    else:
+        champ_winner_id = None
+
+    title = event_data.get("title", "Watch Party Prediction")
+
+    # Build CSV for crediting prizes
+    csv_buffer = io.StringIO()
+    writer = csv.writer(csv_buffer)
+    writer.writerow(["Category", "Discord_ID", "CoinPoker_Username", "Pick"])
+    if first_winner_id:
+        writer.writerow([
+            "1st Elimination",
+            first_winner_id,
+            entries[first_winner_id]["username"],
+            matched_first,
+        ])
+    if champ_winner_id:
+        writer.writerow([
+            "Tournament Winner",
+            champ_winner_id,
+            entries[champ_winner_id]["username"],
+            matched_champ,
+        ])
+
+    csv_buffer.seek(0)
+    csv_file = discord.File(
+        fp=io.BytesIO(csv_buffer.getvalue().encode("utf-8")),
+        filename=f"watchparty_winners_{msg_id}.csv",
+    )
+
+    first_winner_text = (
+        f"<@{first_winner_id}> (`{entries[first_winner_id]['username']}`) — picked **{matched_first}** ({len(first_out_pool)} guessed right)"
+        if first_winner_id
+        else f"No one guessed **{matched_first}**!"
+    )
+
+    champ_winner_text = (
+        f"<@{champ_winner_id}> (`{entries[champ_winner_id]['username']}`) — picked **{matched_champ}** ({len(champion_pool)} guessed right)"
+        if champ_winner_id
+        else f"No one guessed **{matched_champ}**!"
+    )
+
+    result_msg = (
+        f"🏆 **Watch Party Results — `{title}`!**\n"
+        f"*(Total Entries: {len(entries)})*\n\n"
+        f"💀 **First Out (`{matched_first}`):**\n{first_winner_text}\n\n"
+        f"👑 **Tournament Champion (`{matched_champ}`):**\n{champ_winner_text}"
+    )
+
+    await interaction.response.send_message(result_msg, file=csv_file)
 
 
 @bot.tree.error
