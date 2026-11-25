@@ -6,7 +6,7 @@ import os
 import random
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import discord
 from discord import app_commands
@@ -59,6 +59,59 @@ def load_winners_history() -> dict:
 
 def save_winners_history(history: dict):
     save_json(WINNERS_FILE, history)
+
+
+def is_in_history(uid: str, cp_username: str, history: dict) -> bool:
+    locked_discord = history.get("discord_ids", {})
+    locked_usernames = history.get("usernames", {})
+    return (
+        str(uid) in locked_discord
+        or cp_username.strip().lower() in locked_usernames
+    )
+
+
+def pick_prioritized_winners(
+    pool: List[str],
+    entries: Dict[str, dict],
+    history: dict,
+    count: int,
+    already_picked_this_draw: Set[str],
+) -> List[str]:
+    """
+    Select up to `count` winners from `pool` while:
+    1. Avoiding users already picked in `already_picked_this_draw` whenever possible.
+    2. Preferring users not in `winners_history` whenever possible.
+    """
+    if not pool or count <= 0:
+        return []
+
+    chosen: List[str] = []
+
+    tiers = [
+        # Tier 1: Not picked in this draw AND not in past winners history
+        [
+            uid
+            for uid in pool
+            if uid not in already_picked_this_draw
+            and not is_in_history(uid, entries[uid]["username"], history)
+        ],
+        # Tier 2: Not picked in this draw, even if in past winners history
+        [uid for uid in pool if uid not in already_picked_this_draw],
+        # Tier 3: Fallback if pool is exhausted and we still need winners
+        list(pool),
+    ]
+
+    for tier in tiers:
+        candidates = [uid for uid in tier if uid not in chosen]
+        needed = count - len(chosen)
+        if needed <= 0:
+            break
+        if candidates:
+            picks = random.sample(candidates, min(needed, len(candidates)))
+            chosen.extend(picks)
+
+    already_picked_this_draw.update(chosen)
+    return chosen
 
 
 async def auto_close_message(
@@ -549,7 +602,7 @@ async def draw_giveaway(
 
 @bot.tree.command(
     name="check_winner",
-    description="Check if a user has won a past giveaway",
+    description="Check if a user has won a past giveaway or watch party",
 )
 @app_commands.describe(query="Discord ID or CoinPoker username to check")
 @app_commands.checks.has_permissions(manage_messages=True)
@@ -577,13 +630,13 @@ async def check_winner(interaction: discord.Interaction, query: str):
             f"🔍 **Winner Found!**\n"
             f"• **Query Matched:** `{matched_key}`\n"
             f"• **CoinPoker Username:** `{found_record['username']}`\n"
-            f"• **Giveaway ID:** `{found_record['giveaway_id']}`\n"
+            f"• **Event ID:** `{found_record['giveaway_id']}`\n"
             f"• **Won At:** `{found_record['won_at']}`",
             ephemeral=True,
         )
     else:
         await interaction.response.send_message(
-            f"✅ **No history found.** `{query}` has not won any recorded giveaways yet.",
+            f"✅ **No history found.** `{query}` has not won any recorded events yet.",
             ephemeral=True,
         )
 
@@ -719,8 +772,65 @@ async def stop_prediction(interaction: discord.Interaction, message_id: str):
 
 
 @bot.tree.command(
+    name="prediction_stats",
+    description="See how many people picked each player for 1st Out and Winner",
+)
+@app_commands.describe(message_id="The ID of the prediction message")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def prediction_stats(interaction: discord.Interaction, message_id: str):
+    msg_id = message_id.strip()
+    current_preds = load_json(PREDICTIONS_FILE)
+    event_data = current_preds.get(msg_id)
+
+    if not event_data:
+        await interaction.response.send_message(
+            f"❌ Could not find watch party data for message ID `{msg_id}`.",
+            ephemeral=True,
+        )
+        return
+
+    players = event_data.get("players", [])
+    entries = event_data.get("entries", {})
+
+    first_counts = {p: 0 for p in players}
+    champ_counts = {p: 0 for p in players}
+
+    for data in entries.values():
+        fo = data.get("first_out")
+        ch = data.get("champion")
+        if fo:
+            first_counts[fo] = first_counts.get(fo, 0) + 1
+        if ch:
+            champ_counts[ch] = champ_counts.get(ch, 0) + 1
+
+    sorted_first = sorted(
+        first_counts.items(), key=lambda x: (-x[1], x[0].lower())
+    )
+    sorted_champ = sorted(
+        champ_counts.items(), key=lambda x: (-x[1], x[0].lower())
+    )
+
+    first_lines = "\n".join(
+        f"• **{player}:** `{count}`" for player, count in sorted_first
+    )
+    champ_lines = "\n".join(
+        f"• **{player}:** `{count}`" for player, count in sorted_champ
+    )
+
+    title = event_data.get("title", "Watch Party")
+    msg_text = (
+        f"📊 **Pick Breakdown — `{title}`** (`{msg_id}`)\n"
+        f"*Total Submissions: **{len(entries)}***\n\n"
+        f"💀 **1st Out Picks:**\n{first_lines or '*None*'}\n\n"
+        f"👑 **Champion Picks:**\n{champ_lines or '*None*'}"
+    )
+
+    await interaction.response.send_message(msg_text, ephemeral=True)
+
+
+@bot.tree.command(
     name="draw_prediction",
-    description="Draw winners from correct Watch Party picks (default: 2 per category)",
+    description="Draw distinct winners from correct Watch Party picks (default: 2 per category)",
 )
 @app_commands.describe(
     message_id="The ID of the prediction message",
@@ -765,6 +875,8 @@ async def draw_prediction(
 
     entries = event_data["entries"]
     count = max(1, winners_per_pick)
+    history = load_winners_history()
+    picked_this_draw: Set[str] = set()
 
     # Pool 1: Correct 1st Elimination
     first_out_pool = [
@@ -780,28 +892,41 @@ async def draw_prediction(
         if data["champion"] == matched_champ
     ]
 
-    first_winner_ids = (
-        random.sample(first_out_pool, min(count, len(first_out_pool)))
-        if first_out_pool
-        else []
+    first_winner_ids = pick_prioritized_winners(
+        pool=first_out_pool,
+        entries=entries,
+        history=history,
+        count=count,
+        already_picked_this_draw=picked_this_draw,
     )
 
-    # Prioritize distinct winners by excluding first_winner_ids when possible
-    unique_champ_pool = [
-        uid for uid in champion_pool if uid not in first_winner_ids
-    ]
-    champ_winner_ids = random.sample(
-        unique_champ_pool, min(count, len(unique_champ_pool))
+    champ_winner_ids = pick_prioritized_winners(
+        pool=champion_pool,
+        entries=entries,
+        history=history,
+        count=count,
+        already_picked_this_draw=picked_this_draw,
     )
 
-    # If fewer than `count` unique winners were available, top up from overlapping pool
-    if len(champ_winner_ids) < count:
-        overlap_pool = [
-            uid for uid in champion_pool if uid not in champ_winner_ids
-        ]
-        needed = min(count - len(champ_winner_ids), len(overlap_pool))
-        if needed > 0:
-            champ_winner_ids.extend(random.sample(overlap_pool, needed))
+    # Record all drawn watch party winners in winners_history.json
+    all_drawn_ids = list(dict.fromkeys(first_winner_ids + champ_winner_ids))
+    if all_drawn_ids:
+        if "discord_ids" not in history:
+            history["discord_ids"] = {}
+        if "usernames" not in history:
+            history["usernames"] = {}
+
+        win_timestamp = datetime.now(timezone.utc).isoformat()
+        for uid in all_drawn_ids:
+            cp_user = entries[uid]["username"]
+            history["discord_ids"][str(uid)] = {
+                "username": cp_user,
+                "giveaway_id": f"wp_{msg_id}",
+                "won_at": win_timestamp,
+            }
+            history["usernames"][cp_user.lower()] = str(uid)
+
+        save_winners_history(history)
 
     title = event_data.get("title", "Watch Party Prediction")
 
