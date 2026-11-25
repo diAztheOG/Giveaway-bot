@@ -654,6 +654,60 @@ async def reset_history(interaction: discord.Interaction):
     )
 
 
+@bot.tree.command(
+    name="view_entries",
+    description="View exact submitted entries for a giveaway or watch party",
+)
+@app_commands.describe(
+    message_id="The ID of the giveaway or watch party prediction message"
+)
+@app_commands.checks.has_permissions(manage_messages=True)
+async def view_entries(interaction: discord.Interaction, message_id: str):
+    msg_id = message_id.strip()
+    current_giveaways = load_json(DATA_FILE)
+    current_preds = load_json(PREDICTIONS_FILE)
+
+    if msg_id in current_giveaways and current_giveaways[msg_id]:
+        entries = current_giveaways[msg_id]
+        lines = [
+            f"• <@{uid}> (`{uid}`) — `{cp_user}`"
+            for uid, cp_user in entries.items()
+        ]
+        header = f"📋 **Giveaway Entries (`{msg_id}`)** — Total: **{len(lines)}**\n\n"
+    elif msg_id in current_preds and current_preds[msg_id].get("entries"):
+        entries = current_preds[msg_id]["entries"]
+        lines = [
+            f"• <@{uid}> (`{data['username']}`) — 1st Out: **{data['first_out']}** | Winner: **{data['champion']}**"
+            for uid, data in entries.items()
+        ]
+        header = f"🎯 **Watch Party Entries (`{msg_id}`)** — Total: **{len(lines)}**\n\n"
+    else:
+        await interaction.response.send_message(
+            f"❌ No entries found for message ID `{msg_id}`.",
+            ephemeral=True,
+        )
+        return
+
+    body = "\n".join(lines)
+    if len(header) + len(body) <= 1950:
+        await interaction.response.send_message(header + body, ephemeral=True)
+    else:
+        plain_lines = [
+            line.replace("• ", "").replace("`", "").replace("**", "")
+            for line in lines
+        ]
+        buf = io.StringIO("\n".join(plain_lines))
+        file = discord.File(
+            fp=io.BytesIO(buf.getvalue().encode("utf-8")),
+            filename=f"entries_{msg_id}.txt",
+        )
+        await interaction.response.send_message(
+            f"{header}*Too many entries to display inline—attached as a text file.*",
+            file=file,
+            ephemeral=True,
+        )
+
+
 # --- WATCH PARTY PREDICTION COMMANDS ---
 @bot.tree.command(
     name="start_prediction",
@@ -698,8 +752,7 @@ async def start_prediction(
             "2️⃣ **Tournament champion**\n\n"
             f"**Final Table Lineup:**\n{formatted_roster}\n\n"
             "**Rules:**\n"
-            "• One submission per user\n"
-            "• **2 winners** drawn from correct **1st Out** picks & **2 winners** drawn from correct **Champion** picks!"
+            "• One submission per user"
         ),
         color=discord.Color.blurple(),
     )
